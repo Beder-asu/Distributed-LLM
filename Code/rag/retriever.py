@@ -1,147 +1,172 @@
-"""
-Simple Ollama-only inference engine.
+"""RAG retriever backed by ChromaDB + Ollama embeddings.
 
-This file provides a minimal, easy-to-read API that only uses a local
-Ollama model running at `http://localhost:11434`.
+Public API (consumed by llm/inference.py):
+    retrieve_context(query: str, top_k: int = 2) -> str
 
-Usage (quick):
-  1. Install and run Ollama (see README below).
-  2. In Python: `from llm.inference_engine import infer; print(infer('Hello'))`
-
-API:
-  - `infer(prompt, max_tokens=256, context='')` -> single response dict
-  - `stream_infer(prompt, max_tokens=256)` -> simple chunked response
-  - `health_check()` -> checks Ollama + returns basic stats
-  - `set_model(name)` -> change the Ollama model name used for requests
-  - `get_stats()` / `reset_stats()` -> basic engine statistics
-
-This is intentionally simple: no simulators, no remote providers.
+This keeps the original contract while swapping the in-memory keyword
+retrieval for a real vector DB. If ChromaDB is not installed or Ollama
+embeddings are unavailable, it falls back to the keyword retriever with
+an explicit warning.
 """
 
-import time
+from __future__ import annotations
+
+import os
+import re
 import threading
+from typing import Sequence
+from pathlib import Path
+
 import requests
-import uuid
-from typing import Dict, Any
-from rag.retriever import retrieve_context 
-
-# Configuration: update the model name if you want a different local model
-OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "llama3.2:1b"
 
 
-class InferenceEngine:
-    """Lightweight stats collector for Ollama calls."""
+# Ollama config (embeddings)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
-    def __init__(self):
-        self.model = OLLAMA_MODEL
-        self.total_requests = 0
-        self.total_tokens = 0
-        self.total_latency = 0.0
-        self.lock = threading.Lock()
-
-    def _update_stats(self, latency_s: float, tokens: int) -> None:
-        with self.lock:
-            self.total_requests += 1
-            self.total_latency += latency_s
-            self.total_tokens += tokens
-
-    def _get_stats(self) -> Dict[str, Any]:
-        with self.lock:
-            avg = (self.total_latency / self.total_requests) if self.total_requests else 0.0
-            return {
-                "model": self.model,
-                "total_requests": self.total_requests,
-                "total_tokens": self.total_tokens,
-                "avg_latency_ms": round(avg * 1000, 2),
-            }
+# Chroma config (persistent local store)
+CHROMA_COLLECTION = "rag_kb"
+CHROMA_PERSIST_DIR = Path(
+    os.getenv(
+        "CHROMA_PERSIST_DIR",
+        Path(__file__).resolve().parents[1] / "data" / "chroma",
+    )
+)
 
 
-_engine = InferenceEngine()
+# Tiny in-memory knowledge base. Each entry is one document. Replace with a
+# real corpus / vector store in production.
+_KNOWLEDGE_BASE: list[str] = [
+    "Distributed computing splits a workload across multiple machines that "
+    "communicate over a network, solving problems faster than any single machine.",
+    "Load balancing distributes incoming requests across multiple servers using "
+    "strategies such as round robin, least connections, and load-aware routing.",
+    "Round robin scheduling sends each request to the next worker in a fixed "
+    "rotation, regardless of current load on each worker.",
+    "Least connections scheduling sends each new request to the worker with "
+    "the fewest active in-flight requests at the time of dispatch.",
+    "GPU clusters parallelize deep-learning inference by spreading model "
+    "computation across multiple GPUs to maximize throughput.",
+    "Fault tolerance in distributed systems is the ability to keep operating "
+    "correctly when individual nodes fail; common techniques include "
+    "heartbeats, task reassignment, and replication.",
+    "A large language model (LLM) generates text by predicting one token at a "
+    "time conditioned on a preceding context window of tokens.",
+    "Retrieval-Augmented Generation (RAG) enriches an LLM prompt with relevant "
+    "passages retrieved from a knowledge base, improving factual grounding.",
+    "An asyncio event loop in Python schedules coroutines cooperatively, "
+    "allowing many I/O-bound tasks to make progress on a single thread.",
+    "Ollama is a local runtime for running open-weights LLMs such as "
+    "llama3.2 and serving them through an HTTP API on port 11434.",
+    "Heartbeats are periodic 'I am alive' messages sent from a worker to its "
+    "scheduler so the scheduler can detect failed nodes and reassign work.",
+    "A request queue decouples producers and consumers: producers enqueue "
+    "work without waiting, and consumers drain the queue at their own pace.",
+]
 
-# could just call ollama_infer instead of infer()
-# Example Usage: infer(prompt, max_tokens)
-def infer(prompt: str, max_tokens: int = 256) -> Dict[str, Any]:
-    """Send a single synchronous request to the local Ollama server.
 
-    Returns a dictionary with keys: request_id, model, prompt, response, tokens,
-    performance, mode, status (success/error), and optionally error.
-    """
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_collection_lock = threading.Lock()
+_collection = None
+Embedding = Sequence[float]
 
-    context = retrieve_context(prompt)
 
-    request_id = str(uuid.uuid4())[:8]
-    start = time.time()
-    content = f"Context: {context}\n\nUse this context strictly and override any other data you might have, the context is the most relevant\n\nQuestion: {prompt}"
-    payload = {
-        "model": _engine.model,
-        "prompt": content,
-        "stream": False,
-        "options": {"num_predict": min(max_tokens, 512)},
-    }
-    try:
-        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=60)   # setting timeout
+def _tokenize(text: str) -> set[str]:
+    """Lowercase + split on non-alphanumeric. Cheap and dependency-free."""
+    return set(_TOKEN_RE.findall(text.lower()))
+
+
+def _score(query_tokens: set[str], doc_tokens: set[str]) -> int:
+    """Number of shared tokens between query and document."""
+    return len(query_tokens & doc_tokens)
+
+
+def _keyword_retrieve(query: str, top_k: int) -> str:
+    q_tokens = _tokenize(query)
+    if not q_tokens:
+        return ""
+    scored: list[tuple[int, str]] = []
+    for doc in _KNOWLEDGE_BASE:
+        s = _score(q_tokens, _tokenize(doc))
+        if s > 0:
+            scored.append((s, doc))
+    if not scored:
+        return ""
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return " ".join(doc for _, doc in scored[:top_k])
+
+
+def _ollama_embed(texts: list[str]) -> list[Embedding]:
+    """Embed a list of texts using Ollama's /api/embeddings endpoint."""
+    embeddings: list[Embedding] = []
+    for text in texts:
+        payload = {"model": OLLAMA_EMBED_MODEL, "prompt": text}
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/embeddings", json=payload, timeout=60)
+        resp.raise_for_status()
         data = resp.json()
-        if resp.status_code != 200:
-            raise Exception(f"Ollama {resp.status_code}: {data}")
-        # Ollama returns a `response` string and may include `eval_count` tokens
-        text = data.get("response", "")
-        latency = time.time() - start
-        out_tok = data.get("eval_count", len(text.split()))
-        in_tok = data.get("prompt_eval_count", len(content.split()))
-        _engine._update_stats(latency, out_tok)
-        return {
-            "request_id": request_id,
-            "prompt": prompt[:200],
-            "response": text,
-            "tokens": {"input": in_tok, "output": out_tok, "total": in_tok + out_tok},
-            "performance": {"latency_ms": round(latency * 1000, 2)},
-            "status": "success",
-        }
-    except requests.exceptions.ConnectionError:
-        latency = time.time() - start
-        _engine._update_stats(latency, 0)
-        return {
-            "request_id": request_id,
-            "prompt": prompt[:200],
-            "response": "[Ollama not running — start with: ollama serve]",
-            "tokens": {"input": 0, "output": 0, "total": 0},
-            "performance": {"latency_ms": round(latency * 1000, 2)},
-            "status": "error",
-            "error": "Ollama not reachable at localhost:11434",
-        }
-    except Exception as e:
-        latency = time.time() - start
-        _engine._update_stats(latency, 0)
-        return {
-            "request_id": request_id,
-            "prompt": prompt[:200],
-            "response": f"[Ollama Error: {str(e)[:200]}]",
-            "tokens": {"input": 0, "output": 0, "total": 0},
-            "performance": {"latency_ms": round(latency * 1000, 2)},
-            "status": "error",
-            "error": str(e),
-        }
+        embedding = data.get("embedding")
+        if not isinstance(embedding, list):
+            raise ValueError("invalid embedding response from Ollama")
+        embeddings.append([float(x) for x in embedding])
+    return embeddings
 
-# might not need at all
-def health_check() -> Dict[str, Any]:
-    """Simple check for Ollama availability using the base URL."""
+
+def _get_collection():
+    """Get or initialize the Chroma collection, seeding docs on first use."""
+    global _collection
+    if _collection is not None:
+        return _collection
+    with _collection_lock:
+        if _collection is not None:
+            return _collection
+        try:
+            import chromadb  # type: ignore
+        except ImportError:
+            print("[RAG] chromadb not installed; falling back to keyword retrieval.")
+            return None
+
+        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+        collection = client.get_or_create_collection(name=CHROMA_COLLECTION)
+        if collection.count() == 0:
+            try:
+                embeddings = _ollama_embed(_KNOWLEDGE_BASE)
+            except requests.exceptions.RequestException as exc:
+                print(f"[RAG] Ollama embeddings failed ({exc}); falling back to keyword retrieval.")
+                return None
+            collection.add(
+                ids=[f"doc-{i}" for i in range(len(_KNOWLEDGE_BASE))],
+                documents=_KNOWLEDGE_BASE,
+                embeddings=embeddings,
+            )
+        _collection = collection
+        return _collection
+
+
+def retrieve_context(query: str, top_k: int = 2) -> str:
+    """Return the top-k most relevant documents, joined as a single string."""
+    if not query or not query.strip():
+        return ""
+    top_k = max(1, int(top_k))
+
+    collection = _get_collection()
+    if collection is None:
+        return _keyword_retrieve(query, top_k)
+
     try:
-        resp = requests.get(f"{OLLAMA_BASE_URL}/", timeout=10)
-        if resp.status_code == 200:
-            return {"status": "running"}
-        else:
-            return {"status": "error"}
-    except requests.exceptions.RequestException:
-        return {"status": "offline"}
+        query_embedding = _ollama_embed([query])[0]
+    except requests.exceptions.RequestException as exc:
+        print(f"[RAG] Ollama embeddings failed ({exc}); falling back to keyword retrieval.")
+        return _keyword_retrieve(query, top_k)
 
-
-def get_stats() -> Dict[str, Any]:
-    return _engine._get_stats()
-
-
-def reset_stats() -> None:
-    with _engine.lock:
-        _engine.total_requests = 0
-        _engine.total_tokens = 0
-        _engine.total_latency = 0.0
+    results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+    if not isinstance(results, dict):
+        return ""
+    documents = results.get("documents")
+    if not documents or not isinstance(documents, list):
+        return ""
+    first = documents[0] if documents else []
+    if not isinstance(first, list):
+        return ""
+    docs = [d for d in first if isinstance(d, str)]
+    return " ".join(docs) if docs else ""
