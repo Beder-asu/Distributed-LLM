@@ -433,12 +433,14 @@ asyncio.run(benchmark())
 
 ### Repository Enhancement
 
-This repository is a fork of the original course team project. In October 2026,
-Mohamed Beder added an independently attributable verification pass: automated
-balancing and failover tests, continuous integration, dependency manifests,
-dependency-decoupled scheduler imports, a queue-pressure correction for the
-GPU-aware strategy, and a nearest-rank percentile correction. The team credits
-above remain the source of truth for the original implementation.
+This project was created by the team listed above for CSE354. Mohamed Beder was
+an original member of that team, responsible for RAG implementation and LLM
+integration; this GitHub repository is his account's fork of the shared team
+repository. In October 2026, he added a separately attributable verification
+pass: automated balancing and failover tests, continuous integration, dependency
+manifests, dependency-decoupled scheduler imports, a queue-pressure correction
+for the GPU-aware strategy, and a nearest-rank percentile correction. The team
+credits above remain the source of truth for the original implementation.
 
 ---
 
