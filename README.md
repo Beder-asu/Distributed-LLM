@@ -2,7 +2,7 @@
 
 <p align="center">
   <strong>CSE354: Distributed Computing — Ain Shams University, Faculty of Engineering</strong><br>
-  Efficient load balancing and GPU cluster task distribution for handling 1000+ concurrent LLM+RAG requests.
+  A course prototype for load balancing and simulated GPU-cluster task distribution for LLM+RAG requests.
 </p>
 
 <p align="center">
@@ -20,13 +20,13 @@
 
 ## Overview
 
-This project implements a production-oriented distributed system for serving Large Language Model (LLM) inference requests at scale. It combines **real LLM inference** via Ollama (Llama 3.2 1B) with a **Retrieval-Augmented Generation (RAG)** pipeline powered by ChromaDB vector search, while simulating GPU resource behavior to enable stress testing on commodity hardware without enterprise GPUs.
+This course project explores a distributed system for serving Large Language Model (LLM) inference requests. It combines **real LLM inference** via Ollama (Llama 3.2 1B) with a **Retrieval-Augmented Generation (RAG)** pipeline powered by ChromaDB vector search, while simulating GPU resource behavior to enable local stress testing without enterprise GPUs.
 
 The architecture follows a **master-worker pattern** with a pluggable load balancing layer, async request queues, heartbeat-based health monitoring, automatic task reassignment, and structured observability.
 
 ### Key Capabilities
 
-- **1,000+ concurrent users** via async load generation with bounded concurrency
+- **Configurable load generation** with bounded concurrency, including 100/500/1000-user benchmark presets
 - **Real LLM inference** through Ollama HTTP API (not simulated)
 - **RAG enrichment** with ChromaDB + Ollama embeddings + keyword fallback
 - **4 load balancing strategies**: Round Robin, Least Connections, Load-Aware, GPU-Aware
@@ -146,9 +146,16 @@ Structured JSON logging emits the following event types:
 ### Prerequisites
 
 - Python 3.12+
-- `requests` library (`pip install requests`)
-- `chromadb` library (`pip install chromadb`)
 - [Ollama](https://ollama.com) installed and running locally
+
+Install the runtime dependencies from the repository root:
+
+```bash
+python -m pip install -r requirements-rag.txt
+```
+
+Use `requirements.txt` instead when you only need the scheduler and Ollama HTTP
+client, without ChromaDB-backed retrieval.
 
 ### Install Ollama Models
 
@@ -178,17 +185,13 @@ python main.py --mode async
 python main.py --mode hardening
 ```
 
-### Run Fault Tolerance Tests
+### Run Verification Tests
 
-These tests don't require Ollama — they use stubs and complete in seconds:
+These tests use deterministic stubs, so they do not require Ollama, ChromaDB,
+or a GPU:
 
 ```bash
-cd Code
-python test_step15.py         # Health-check eviction
-python test_step16_17.py      # Timeout + reassignment
-python test_step18.py         # simulate_failure end-to-end
-python test_step19.py         # Load-aware burst distribution
-python test_step20.py         # Latency percentiles + throughput
+python -m unittest discover -s tests -v
 ```
 
 ### Environment Variables
@@ -204,32 +207,34 @@ python test_step20.py         # Latency percentiles + throughput
 ## Project Structure
 
 ```
-Code/
-├── main.py                          # Entry point: sync | async | hardening
-├── client/
-│   ├── async_load_generator.py      # Async stress testing (100/500/1000 users)
-│   └── load_generator.py            # Threaded load generator
-├── common/
-│   ├── models.py                    # Request / Response dataclasses
-│   ├── metrics.py                   # Rolling windows + p50/p95/p99
-│   ├── gpu_sim.py                   # GPU util/VRAM/saturation simulation
-│   ├── structured_logging.py        # JSON event logging
-│   └── hardening.py                 # Shutdown/recovery validation suite
-├── lb/
-│   └── load_balancer.py             # Round-robin load balancer
-├── llm/
-│   └── inference.py                 # infer() -> Ollama HTTP API
-├── rag/
-│   └── retriever.py                 # ChromaDB + keyword retrieval
-├── master/
-│   └── scheduler.py                 # Master scheduler with registry, health, metrics
-├── workers/
-│   └── gpu_worker.py                # GPU worker with queues, heartbeats, GPU sim
-├── test_step15.py                   # Health-check eviction test
-├── test_step16_17.py                # Timeout + reassignment test
-├── test_step18.py                   # Failure simulation test
-├── test_step19.py                   # Load-aware burst distribution test
-└── test_step20.py                   # Latency percentile + throughput test
+.
+├── .github/workflows/ci.yml          # Compile + test checks on pushes and PRs
+├── requirements.txt                  # Scheduler/Ollama HTTP dependency
+├── requirements-rag.txt              # Full RAG runtime dependencies
+├── tests/
+│   ├── test_balancing.py             # Strategy selection + percentile tests
+│   └── test_scheduler_failover.py     # Timeout, failure, and retry tests
+└── Code/
+    ├── main.py                       # Entry point: sync | async | hardening
+    ├── client/
+    │   ├── async_load_generator.py   # Async configurable load generator
+    │   └── load_generator.py         # Threaded load generator
+    ├── common/
+    │   ├── models.py                 # Request / Response dataclasses
+    │   ├── metrics.py                # Rolling windows + p50/p95/p99
+    │   ├── gpu_sim.py                # GPU util/VRAM/saturation simulation
+    │   ├── structured_logging.py     # JSON event logging
+    │   └── hardening.py              # Shutdown/recovery validation suite
+    ├── lb/
+    │   └── load_balancer.py          # Round-robin load balancer
+    ├── llm/
+    │   └── inference.py              # infer() -> Ollama HTTP API
+    ├── rag/
+    │   └── retriever.py              # ChromaDB + keyword retrieval
+    ├── master/
+    │   └── scheduler.py              # Registry, health, strategies, metrics
+    └── workers/
+        └── gpu_worker.py             # Queues, heartbeats, GPU simulation
 ```
 
 ---
@@ -341,15 +346,16 @@ context = retrieve_context("What is distributed computing?", top_k=2)
 
 ### Component Tests
 
-Each fault-tolerance mechanism has a dedicated test file:
+The dependency-free verification suite covers round-robin, least-connections,
+load-aware and GPU-aware selection; nearest-rank percentile calculation; and
+failure, timeout, reassignment, and retry-exhaustion behavior:
 
 ```bash
-python test_step15.py    # Verify health monitor evicts stale workers
-python test_step16_17.py # Verify timeout triggers reassignment
-python test_step18.py    # Verify simulate_failure triggers eviction
-python test_step19.py    # Verify load-aware distributes bursts evenly
-python test_step20.py    # Verify latency percentile calculations
+python -m compileall -q Code tests
+python -m unittest discover -s tests -v
 ```
+
+The same checks run in GitHub Actions on every push and pull request.
 
 ### Integration Tests
 
@@ -410,7 +416,7 @@ asyncio.run(benchmark())
 
 - **Single Ollama Instance**: Throughput is ultimately limited by the single Ollama process. For higher throughput, run multiple Ollama instances behind the scheduler with more workers.
 - **Model Size**: Llama 3.2 1B provides fast responses for demonstration. Larger models will increase latency proportionally.
-- **Concurrent Users**: The async design handles 1000+ concurrent users efficiently, but Ollama's processing queue determines actual throughput.
+- **Concurrent Users**: The load generator includes presets up to 1,000 concurrent users, but this repository does not publish reproducible benchmark results; actual throughput depends heavily on the Ollama host and model.
 - **GPU Simulation**: GPU metrics are simulated for scheduling decisions. They don't reflect real GPU state but provide realistic scheduling signals.
 
 ---
@@ -424,6 +430,15 @@ asyncio.run(benchmark())
 | **Muhammed Yassin** | Load Balancer, Client Components |
 | **Ziad Tamer** | Client Load Generation |
 | **Mohamed Beder** | RAG Implementation, LLM Integration |
+
+### Repository Enhancement
+
+This repository is a fork of the original course team project. In October 2026,
+Mohamed Beder added an independently attributable verification pass: automated
+balancing and failover tests, continuous integration, dependency manifests,
+dependency-decoupled scheduler imports, a queue-pressure correction for the
+GPU-aware strategy, and a nearest-rank percentile correction. The team credits
+above remain the source of truth for the original implementation.
 
 ---
 

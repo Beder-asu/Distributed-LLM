@@ -43,6 +43,7 @@ def percentiles(values: list[float], percentiles: tuple[int, ...]) -> tuple[floa
     n = len(s)
     out = []
     for p in percentiles:
-        idx = min(n - 1, max(0, math.ceil(p / 100.0 * n)))
+        # Nearest-rank uses a one-based rank. Convert it to a zero-based index.
+        idx = min(n - 1, max(0, math.ceil(p / 100.0 * n) - 1))
         out.append(s[idx])
     return tuple(out)

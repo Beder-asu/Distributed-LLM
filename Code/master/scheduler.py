@@ -25,16 +25,21 @@ Step 21: optional dashboard loop (`start_dashboard()` / `stop_dashboard()`)
          seconds — opt-in so existing tests/scripts stay quiet by default.
 """
 
+from __future__ import annotations
+
 import asyncio
 import time
 import threading
 from dataclasses import dataclass, field
 from collections import deque
+from typing import TYPE_CHECKING
 
 from lb.load_balancer import LoadBalancer
-from workers.gpu_worker import GPUWorker
 from common.metrics import percentiles as _calc_percentiles
 from common.structured_logging import get_logger
+
+if TYPE_CHECKING:
+    from workers.gpu_worker import GPUWorker
 
 
 class LeastConnectionsBalancer:
@@ -85,11 +90,26 @@ class GPUAwareBalancer:
     def __init__(self, workers: list[GPUWorker]):
         self.workers = workers
 
+    @staticmethod
+    def _saturation_score(worker) -> float:
+        """Estimate live saturation without mutating the GPU simulator.
+
+        Mirrors ``GPUSimulator.update``: GPU utilization contributes 60% and
+        queue pressure contributes 40%. Reading the queue directly makes the
+        scheduling decision reflect work that is waiting but not yet running.
+        """
+        util = max(0.0, min(1.0, worker.gpu_sim.util_pct / 100.0))
+        queue = getattr(worker, "_queue", None)
+        queue_depth = queue.qsize() if queue is not None else 0
+        capacity = 2.0 * max(1, getattr(worker, "concurrency", 1))
+        queue_pressure = min(1.0, queue_depth / capacity)
+        return 0.6 * util + 0.4 * queue_pressure
+
     def get_next_worker(self) -> GPUWorker:
-        # Primary key: saturation score; secondary: pending count; tertiary: id.
+        # Primary key: composite saturation; secondary: pending; tertiary: id.
         return min(
             self.workers,
-            key=lambda w: (w.gpu_sim.util_pct / 100.0, w.pending, w.id),
+            key=lambda w: (self._saturation_score(w), w.pending, w.id),
         )
 
     def dispatch(self, request):
@@ -393,7 +413,7 @@ class Scheduler:
                 last_error = e
                 logger.timeout(request.id, worker.id, attempt, self.REQUEST_TIMEOUT)
                 self._record_timeout()
-                if attempt < self.MAX_ATTEMPTS:
+                if attempt < self.MAX_ATTEMPTS and self._has_untried_worker(tried):
                     logger.reassign(request.id, worker.id, -1, attempt)
                     self._record_retry()
                 print(
@@ -403,7 +423,7 @@ class Scheduler:
             except Exception as e:
                 last_error = e
                 self._record_failure()
-                if attempt < self.MAX_ATTEMPTS:
+                if attempt < self.MAX_ATTEMPTS and self._has_untried_worker(tried):
                     logger.reassign(request.id, worker.id, -1, attempt)
                     self._record_retry()
                 print(
@@ -443,6 +463,10 @@ class Scheduler:
             if w.id not in skip:
                 return w
         return None
+
+    def _has_untried_worker(self, tried: set[int]) -> bool:
+        """Return whether a retry can actually target another worker."""
+        return any(worker_id not in tried for worker_id in self.workers)
 
     def cluster_status(self) -> dict:
         """Snapshot of the cluster: per-worker stats + aggregates.
